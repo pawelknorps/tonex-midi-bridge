@@ -100,9 +100,15 @@ class TonexDevice:
     def _read_loop(self) -> None:
         buf = bytearray()
         while not self._stop.is_set():
-            if not self.ser:
+            ser = self.ser
+            if ser is None:
                 return
-            chunk = self.ser.read(512)
+            try:
+                chunk = ser.read(512)
+            except Exception:
+                if self._stop.is_set():
+                    return
+                continue
             if not chunk:
                 continue
             buf += chunk

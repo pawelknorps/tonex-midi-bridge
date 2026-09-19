@@ -8,6 +8,20 @@ Ableton ──MIDI──> IAC Driver Bus ──> tonex_bridge.py ──USB-C (se
 
 Protokół to byte-exact port trzech niezależnych implementacji: `tonex.js` (edytor WebSerial), `PyTonexControl` i firmware `Builty/TonexOneController` — zweryfikowany testami wektorowymi (patrz niżej).
 
+## ✅ Zweryfikowano na żywo
+
+Przetestowane na prawdziwym TONEX One (`/dev/cu.usbmodem211401`, VID 1963:00D1):
+
+- sync stanu pedała: **164 B**, sloty A/B/C, active, bypass, BPM, tuner 440 Hz, trim 1.5
+- przełączanie presetów z potwierdzeniem pedała (16→17→16), stan pedała odczytany w odpowiedzi
+- pełny E2E przez prawdziwy IAC bus: **PC 3, CC127=8, PC 16** — wszystkie wykonane i zalogowane przez mostek
+- testy wektorowe: `test_proto.py` **10/10**
+
+## Dokumentacja
+
+- `docs/jak-to-dziala.md` — szczegóły techniczne: protokół USB (HDLC, CRC, komunikaty, layout stanu 164 B), semantyka load_preset, parametry/globalsy, zagrożenia
+- `docs/ableton.md` — integracja z Ableton krok po kroku (IAC, automatyzacja CC127, Max for Live PC, hardware MIDI, debug)
+
 ## Instalacja
 
 ```bash
