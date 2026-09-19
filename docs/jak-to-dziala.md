@@ -106,3 +106,22 @@ Pełna tabela w README; kluczowe: `PC 0-19` / `CC 127 0-19` → preset, `CC 86/8
 - Wektory byte-exact: `test_proto.py` (10 testów) vs PyTonexControl + `node scripts/gen_vectors.js`.
 - Na żywo (Twój pedał, `/dev/cu.usbmodem211401`): sync stanu 164 B ✅, przełączenie 16↔17 z potwierdzeniem pedała ✅, E2E przez prawdziwy IAC (PC 3, CC127=8, PC 16 restore) ✅.
 - Mostek leci w jednym procesie, bez GUI; Ctrl+C = czyste zamknięcie portu.
+
+## 10. Nazwy presetów
+
+Odpowiedź na `req_preset(i)` zawiera blok nazwy: marker `B9 04 B9 02 BC 21` + 32 bajty (cięte na pierwszym 0x00, UTF-8). Mostek pobiera 20 nazw **sekwencyjnie** przy starcie (reader przypisuje odpowiedzi w kolejności zapytań — pedał odpowiada seryjnie, potwierdzone na żywo: 20/20, poprawnie przypisane). Nazwy pojawiają się w logach (`preset -> 4  [TJ DMBL ODS 124 NRB CLN]`), w `names`, `status` i `--list-presets`.
+
+## 11. MIDI clock → BPM (tonex_features.ClockSync)
+
+- Impulsy 24 ppq → BPM = 60/(dt·24) per interwał; okno 16 próbek, pierwszy commit po 6.
+- Bramki: rozsiew okna ≤4 BPM (jitter ignorowany), zmiana ≥1 BPM vs ostatni zapis, cooldown 0,5 s.
+- `reset()` na `start/continue/stop` i po 1,5 s ciszy (w pętli głównej).
+- Zapis idzie przez globalny parametr 110 (patch stanu → `set_state`) — **trwały dla pedała**. Na żywo: trening 120 BPM zmienił BPM pedała 45→120, przywrócone po teście.
+
+## 12. Setlist / noty / CLI / reconnect
+
+- **Setlist**: `[{"song","preset"}]`; CC 84/85 (konfigurowalne) + CLI `song next|prev|goto`; przeładowanie w locie `setlist <plik>`.
+- **Noty**: `--note-base N` — note-on z zakresu N..N+19 → preset; tylko dedicated channel (izolacja od melodii).
+- **CLI (stdin)**: `preset/p | up | down | bypass | vol | db | param <idx> <val> | bpm | names | status | song | setlist | map <cc> <param> | clock | help | quit`.
+- **Reconnect**: `write()` ustawia `failed` przy błędzie serialu (np. odpięcie USB); pętla główna próbuje ponownie co 1,5 s (re-open + re-sync + re-fetch nazw) — bez restartu mostka. Reader ma backoff 50 ms, żeby nie kręcić CPU na odpiętym urządzeniu.
+- **Wirtualny port**: `mido.open_input("ToneX Bridge", virtual=True)` — CoreMIDI destination widoczny dla Abletona; fallback na IAC.

@@ -1,26 +1,38 @@
-# tonex-midi-bridge — Ableton → TONEX One (software MIDI bridge)
+# tonex-midi-bridge — Ableton → TONEX One (software MIDI bridge, SOTA)
 
-Dokładnie to o co pytałeś: **pełna kontrola TONEX One z Abletona bez kupowania ESP32**. Pedał zostaje podpięty USB-C do komputera, a ten skrypt tłumaczy MIDI (z IAC bus / dowolnego źródła) na natywny protokół USB pedała.
+Pełna kontrola TONEX One z Abletona **bez kupowania ESP32**. Pedał zostaje podpięty USB-C do komputera, a ten skrypt tłumaczy MIDI na natywny protokół USB pedała.
 
 ```
-Ableton ──MIDI──> IAC Driver Bus ──> tonex_bridge.py ──USB-C (serial 115200)──> TONEX One
+Ableton ──MIDI──> "ToneX Bridge" (wirtualny port, zero konfiguracji!) ──> tonex_bridge.py ──USB-C──> TONEX One
 ```
 
-Protokół to byte-exact port trzech niezależnych implementacji: `tonex.js` (edytor WebSerial), `PyTonexControl` i firmware `Builty/TonexOneController` — zweryfikowany testami wektorowymi (patrz niżej).
+## Funkcje
+
+- **Wirtualny port MIDI „ToneX Bridge"** — tworzony na starcie, widoczny w Live jako zwykłe wyjście; **IAC nie jest już potrzebny** (fallback automatyczny)
+- **Przełączanie presetów**: PC 0-19, CC 127 (0-19), CC 86/87 up/down, **noty MIDI** (pady: `--note-base`)
+- **Nazwy presetów** — 20 nazw pobieranych z pedała na starcie, pokazywane w logach i `--list-presets`
+- **MIDI clock → BPM pedała** — delaye i modyfikacje śledzą tempo Live'a (histereza anty-jitter; `--no-clock`)
+- **Setlist** — mapa utwór→preset (`--setlist`, CC 84/85 song next/prev)
+- **Global volume (CC 122), bypass (CC 123), BPM (CC 88), pełna mapa parametrów CC**
+- **Interaktywny CLI** — `preset 5`, `param 20 5.5`, `names`, `status`, `song next`, `map 40 20`, ...
+- **Auto-reconnect** — odepnij/zapnij pedał bez restartu mostka
+- **Config JSON** (`--config`) + `--param-map`, `--channel`
 
 ## ✅ Zweryfikowano na żywo
 
-Przetestowane na prawdziwym TONEX One (`/dev/cu.usbmodem211401`, VID 1963:00D1):
+Przetestowane na prawdziwym TONEX One (`/dev/cu.usbmodem211401`):
 
-- sync stanu pedała: **164 B**, sloty A/B/C, active, bypass, BPM, tuner 440 Hz, trim 1.5
-- przełączanie presetów z potwierdzeniem pedała (16→17→16), stan pedała odczytany w odpowiedzi
-- pełny E2E przez prawdziwy IAC bus: **PC 3, CC127=8, PC 16** — wszystkie wykonane i zalogowane przez mostek
-- testy wektorowe: `test_proto.py` **10/10**
+- sync stanu pedała (164 B), **nazwy presetów 20/20 poprawnie przypisane** (np. preset 12 = „Morning Glory")
+- przełączanie: CC127 → 4, nota 48 → 12, PC → 16 — z potwierdzeniem stanu pedała
+- **MIDI clock 120 BPM → pedał przełączył BPM 45 → 120** (potem przywrócone bit-w-bit)
+- wirtualny port „ToneX Bridge" widoczny w CoreMIDI jako destination
+- setlist CC84 → „Outro"; CLI `names`/`status`/`bpm` działają
+- testy wektorowe: `test_proto.py` **10/10** + `test_features.py` **9/9**
 
 ## Dokumentacja
 
-- `docs/jak-to-dziala.md` — szczegóły techniczne: protokół USB (HDLC, CRC, komunikaty, layout stanu 164 B), semantyka load_preset, parametry/globalsy, zagrożenia
-- `docs/ableton.md` — integracja z Ableton krok po kroku (IAC, automatyzacja CC127, Max for Live PC, hardware MIDI, debug)
+- `docs/jak-to-dziala.md` — protokół USB (HDLC, CRC, layout stanu), semantyka komend, nowe funkcje
+- `docs/ableton.md` — integracja z Ableton krok po kroku (wirtualny port, clock, setlist, noty)
 
 ## Instalacja
 
@@ -30,17 +42,21 @@ python3 -m venv .venv
 .venv/bin/pip install pyserial mido python-rtmidi
 ```
 
-## Setup MIDI (IAC — raz na zawsze)
+## Setup MIDI (wirtualny port — zero konfiguracji)
 
-1. **Audio MIDI Setup** (aplikacja macOS) → **IAC Driver** → zaznacz **Device is online** → nazwa np. „IAC Driver Bus 1".
-2. **Ableton Live** → Preferences → **Link, Tempo & MIDI**: w „Control Surface" zostaw puste; w listach portów znajdź **IAC Driver Bus 1** i zapal **Track** (Output). Zamykaj/zaznaczaj ostrożnie — IAC widoczny tylko po włączeniu „Device is online".
+**Nie musisz nic konfigurować.** Mostek tworzy w starcie wirtualny port **„ToneX Bridge"** (wpisany do CoreMIDI). Wystarczy w **Ableton Live → Preferences → Link, Tempo & MIDI** znaleźć go w listach i zapalić **Output → Track** (żółte pole). Gotowe.
+
+IAC jest opcjonalny (fallback, gdy wirtualny port się nie stworzy — wtedy: Audio MIDI Setup → IAC Driver → „Device is online" → zapal Track dla „IAC Driver Bus 1").
 
 ## Uruchomienie
 
 ```bash
-.venv/bin/python tonex_bridge.py            # auto: znajdzie TONEX One + pierwszy port IAC
-.venv/bin/python tonex_bridge.py --scan     # lista portów serial/MIDI
-.venv/bin/python tonex_bridge.py --channel 1 --verbose
+.venv/bin/python tonex_bridge.py                     # auto: TONEX + wirtualny "ToneX Bridge"
+.venv/bin/python tonex_bridge.py --scan              # lista portów serial/MIDI
+.venv/bin/python tonex_bridge.py --list-presets      # nazwy 20 presetów z pedała i wyjście
+.venv/bin/python tonex_bridge.py --note-base 36 --setlist setlist.json --channel 1
+.venv/bin/python tonex_bridge.py --config bridge.json
+.venv/bin/python tonex_bridge.py --no-clock          # wyłącz sync BPM z MIDI clock
 ```
 
 ## Mapa MIDI
@@ -53,6 +69,9 @@ python3 -m venv .venv
 | CC 123 | ≥64 | bypass toggle |
 | CC 122 | 0–127 | global volume (−40…+3 dB) |
 | CC 88 | 0–127 | BPM (40–240) |
+| **MIDI clock** | — | sync BPM pedała do tempa Live (histereza; `--no-clock`) |
+| **Note on** | N..N+19 | preset 0..19 *(tylko z `--note-base N`, np. 36 dla APC)* |
+| CC 84 / 85 | ≥64 | song next / prev *(tylko z `--setlist`)* |
 | CC 2 | ≥64/off | Delay Power |
 | CC 5, 6, 8 | 0–127 | Dig. Delay Time / Feedback / Mix |
 | CC 18, 19 | ≥64 / 0–127 | Comp Power / Comp Threshold |
@@ -68,9 +87,9 @@ Numery CC parametrów celowo zgodne z `MidiCommands.md` projektu Builty — jak 
 
 Live **nie potrafi wysyłać Program Change z klipów** (brak lane'u PC), ale CC automatyzuje natywnie:
 
-1. Utwórz track MIDI, **MIDI From: IAC Driver Bus 1** (albo wyjście przez External Instrument).
+1. Utwórz track MIDI, **MIDI From: ToneX Bridge** (wirtualny port mostka).
 2. W Automation Lane wybierz **CC127** → rysuj segmenty 0…19 w miejscach zmian sekcji utworu.
-3. Gotowe — preset przełącza się w locie. Ponowne wysłanie tej samej wartości (pętla klipu) jest ignorowane (brak „audio gap"), chyba że użyjesz `--toggle-on-repeat` (zachowanie edytora: drugi raz ten sam preset = bypass).
+3. Gotowe — preset przełącza się w locie. Ponowne wysłanie tej samej wartości (pętla klipu) jest ignorowane (brak „audio gap"), chyba że użyjesz flagi `--toggle-on-repeat` (zachowanie edytora: drugi raz ten sam preset = bypass).
 
 Alternatywnie dla PC: małe urządzenie Max for Live `[midiin] → [midiparse p] → [pgmout] → [midiout]` albo zewnętrzna klawiatura MIDI z PC.
 

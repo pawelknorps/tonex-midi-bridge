@@ -27,6 +27,9 @@ HDLC_FLAG = 0x7E
 HDLC_ESC = 0x7D
 HDLC_MASK = 0x20
 
+# marker of the preset-name block inside a preset-detail response (tonex.js _PM)
+PRESET_NAME_MARKER = bytes([0xB9, 0x04, 0xB9, 0x02, 0xBC, 0x21])
+
 # ---- state offsets: SO_* from start, SE_* from END -------------------------
 SO_TRIM = 15          # float32 LE
 SO_CAB = 20           # byte
@@ -159,6 +162,25 @@ def parse_state(payload: bytes) -> bytes | None:
     if len(sd) < _MIN_STATE_LEN:
         return None
     return sd
+
+
+def parse_preset_name(payload: bytes) -> str | None:
+    """Extract the 32-byte preset name from a preset-detail response.
+
+    Port of tonex.js _parseName: find the marker, read up to 32 bytes,
+    cut at the first NUL, decode and trim. None when no marker/empty.
+    """
+    i = payload.find(PRESET_NAME_MARKER)
+    if i < 0:
+        return None
+    raw = payload[i + len(PRESET_NAME_MARKER): i + len(PRESET_NAME_MARKER) + 32]
+    if not raw:
+        return None
+    end = raw.find(0)
+    if end >= 0:
+        raw = raw[:end]
+    name = raw.decode("utf-8", errors="replace").strip()
+    return name or None
 
 
 def active_idx(sd: bytes) -> int:
