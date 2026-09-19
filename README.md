@@ -1,4 +1,6 @@
-# tonex-midi-bridge — Ableton → TONEX One (software MIDI bridge, SOTA)
+# tonex-midi-bridge — Ableton → TONEX One (software MIDI bridge)
+
+**Repo: <https://github.com/pawelknorps/tonex-midi-bridge>**
 
 Pełna kontrola TONEX One z Abletona **bez kupowania ESP32**. Pedał zostaje podpięty USB-C do komputera, a ten skrypt tłumaczy MIDI na natywny protokół USB pedała.
 
