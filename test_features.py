@@ -8,8 +8,12 @@ Run: .venv/bin/python -m pytest test_features.py -q  (or: python test_features.p
 import time
 from types import SimpleNamespace
 
-from tonex_features import ClockSync, Setlist, note_preset
-from tonex_proto import MAX_PRESETS, PRESET_NAME_MARKER, parse_preset_name
+from tonex_features import ClockSync, Setlist, TapTempo, note_preset
+from tonex_proto import (
+    MAX_PRESETS, PRESET_NAME_MARKER, parse_preset_name,
+    set_slot_patch, toggle_slot_patch,
+)
+from test_proto import STATE
 
 
 def _name_payload(name: str) -> bytes:
@@ -119,8 +123,16 @@ class StubDev:
         self.last = ("bypass",)
         return "bypass toggle"
 
+    def set_slot(self, slot, n):
+        self.last = ("slot", slot, n)
+        return f"slot {'ABC'[slot]} -> {n}"
 
-def _mkctx(note_base=None, clock_on=False, setlist=None):
+    def toggle_ab(self):
+        self.last = ("ab",)
+        return "A/B toggle"
+
+
+def _mkctx(note_base=None, clock_on=False, setlist=None, tap_cc=10):
     import tonex_bridge as tb
     return SimpleNamespace(
         dev=StubDev(), param_cc=dict(tb.DEFAULT_PARAM_CC),
@@ -128,6 +140,8 @@ def _mkctx(note_base=None, clock_on=False, setlist=None):
         clock_on=clock_on, clock=ClockSync(), last_clock=0.0, done=False,
         setlist=setlist,
         song_ccs={"next": 84, "prev": 85} if setlist else {},
+        tap=TapTempo(), tap_cc=tap_cc, fb=None, log=lambda s: None,
+        osc_host="127.0.0.1", osc_port=None,
     )
 
 
@@ -196,6 +210,85 @@ def test_song_nav_and_cli():
     assert tb.run_command("bogus", ctx2)[0].startswith("unknown")
     tb.run_command("quit", ctx2)
     assert ctx2.done is True
+
+
+def test_slot_patches():
+    p = set_slot_patch(STATE, 0, 5)
+    assert p is not None and p[-18] == 5 and p[-16] == 7 and p[-7] == 1
+    assert set_slot_patch(STATE, 0, 2) is None            # already in slot A
+    p = set_slot_patch(STATE, 1, 9)
+    assert p is not None and p[-16] == 9
+    p = set_slot_patch(STATE, 2, 12)
+    assert p is not None and p[-14] == 12
+    try:
+        set_slot_patch(STATE, 4, 0)
+        assert False, "should raise"
+    except ValueError:
+        pass
+
+
+def test_toggle_slot_patch():
+    p = toggle_slot_patch(STATE)          # currentSlot 0 -> 1
+    assert p[-11] == 1 and p[-12] == 0 and p[-7] == 1
+    assert toggle_slot_patch(p)[-11] == 0  # and back
+
+
+def test_tap_tempo():
+    tt = TapTempo()
+    assert tt.tap(100.0) is None                         # single tap
+    assert tt.tap(100.5) == 120.0                        # 0.5 s -> 120 BPM
+    assert tt.tap(101.0) is None                         # same tempo, no rewrite
+    tt2 = TapTempo()
+    tt2.tap(100.0)
+    tt2.tap(103.0)                                       # gap > max_gap: reset
+    tt2.tap(103.5)
+    assert tt2.last_written == 120.0
+
+
+def test_router_slots_tap_tempo():
+    import mido
+    import tonex_bridge as tb
+
+    ctx = _mkctx()
+    assert tb.handle_midi_msg(mido.Message("control_change", control=124, value=5), ctx) is not None
+    assert ctx.dev.last == ("slot", 0, 5)
+    assert tb.handle_midi_msg(mido.Message("control_change", control=125, value=9), ctx) is not None
+    assert ctx.dev.last == ("slot", 1, 9)
+    assert tb.handle_midi_msg(mido.Message("control_change", control=126, value=100), ctx) is not None
+    assert ctx.dev.last == ("ab",)
+    # tap tempo: two CC10 taps ~0.5 s apart -> ~120 BPM write (macOS sleep
+    # granularity ±10 % — assert the write happened in the expected band)
+    assert tb.handle_midi_msg(mido.Message("control_change", control=10, value=100), ctx) is None
+    time.sleep(0.52)
+    r = tb.handle_midi_msg(mido.Message("control_change", control=10, value=100), ctx)
+    assert r is not None and ctx.dev.last[0] == "param" and ctx.dev.last[1] == 110
+    assert 105 <= ctx.dev.last[2] <= 125, ctx.dev.last
+
+
+def test_osc_route():
+    import tonex_bridge as tb
+    from tonex_osc import decode
+
+    ctx = _mkctx()
+    logs = []
+    ctx.log = logs.append
+
+    tb.handle_osc("/preset", [7], ctx)
+    assert ctx.dev.last == ("preset", 7) and logs and "preset -> 7" in logs[-1]
+    tb.handle_osc("/param", [20, 5.5], ctx)
+    assert ctx.dev.last == ("param", 20, 5.5)
+    tb.handle_osc("/slot", [1, 9], ctx)
+    assert ctx.dev.last == ("slot", 1, 9)
+    tb.handle_osc("/toggle", [], ctx)
+    assert ctx.dev.last == ("ab",)
+    tb.handle_osc("/vol", [0.5], ctx)
+    assert ctx.dev.last == ("param", 116, -18.5)          # -40 + 43*0.5
+    tb.handle_osc("/nope", [], ctx)
+    assert "unknown" in logs[-1]
+    reply = tb.handle_osc("/names", [], ctx)
+    assert reply is not None and decode(reply)[0] == "/names"
+    reply = tb.handle_osc("/status", [], ctx)
+    assert reply is not None and "preset" in decode(reply)[1][0]
 
 
 if __name__ == "__main__":

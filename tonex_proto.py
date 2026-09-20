@@ -209,6 +209,34 @@ def state_info(sd: bytes) -> dict:
     }
 
 
+def set_slot_patch(sd: bytes, slot: int, n: int) -> bytes | None:
+    """Load preset n into slot A/B/C (0/1/2) without switching the active slot.
+
+    Returns patched state, or None when the slot already holds n.
+    When `slot` == current slot, the pedal switches to n (set_state triggers it).
+    """
+    if not (0 <= slot <= 2) or not (0 <= n < MAX_PRESETS):
+        raise ValueError("slot/name out of range")
+    patch = bytearray(sd)
+    off = (-SE_SA, -SE_SB, -SE_SC)[slot]
+    if patch[off] == n:
+        return None
+    patch[off] = n
+    patch[-SE_DMON] = 1
+    return bytes(patch)
+
+
+def toggle_slot_patch(sd: bytes) -> bytes:
+    """Flip the current slot A<->B — mirrors the pedal footswitch, no preset reload."""
+    patch = bytearray(sd)
+    cur = patch[-SE_SLOT]
+    if cur in (0, 1):
+        patch[-SE_SLOT] = 1 - cur
+    patch[-SE_BYP] = 0
+    patch[-SE_DMON] = 1
+    return bytes(patch)
+
+
 def load_preset_patch(sd: bytes, n: int, toggle_on_repeat: bool = False) -> bytes | None:
     """Return the state patched to make preset n active, or None if it is a no-op.
 

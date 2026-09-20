@@ -17,11 +17,13 @@ IAC zostaje jako fallback (gdy wirtualny port jest niedostępny): Audio MIDI Set
 
 ```bash
 cd ~/tonex-utilities/tonex-midi-bridge
-.venv/bin/python tonex_bridge.py                # auto: TONEX + IAC
+.venv/bin/python tonex_bridge.py                # auto: TONEX + ToneX Bridge (wirtualny)
 .venv/bin/python tonex_bridge.py --verbose      # podgląd stanu pedała na żywo
 ```
 
 Oczekiwany start: `ready : active preset N (slot A) bpm … bypass 0`.
+
+**Auto-start (opcjonalnie)**: `scripts/install-launchagent.sh` — mostek startuje przy logowaniu i nie umiera (KeepAlive); logi w `~/Library/Logs/tonex-bridge*.log`. Odinstaluj: `scripts/install-launchagent.sh uninstall`.
 
 ## 4. Automatyzacja presetów w czasie — CC 127 (ścieżka natywna)
 
@@ -106,7 +108,9 @@ Mostek słucha **dowolnego** wejścia MIDI:
 
 ## 11. Interaktywny CLI (stdin)
 
-Po starcie mostek przyjmuje komendy z terminala: `help`, `preset 5`, `p 12`, `up`/`down`, `bypass`, `vol 0.5`, `db -12`, `param 20 5.5`, `bpm 120`, `names`, `status`, `song next`, `setlist plik.json`, `map 40 20`, `clock on|off`, `quit`. Przydatne na próbach (zmiana brzmienia bez schylania się do pedała).
+Po starcie mostek przyjmuje komendy z terminala: `help`, `preset 5`, `p 12`, `up`/`down`, `bypass`, `vol 0.5`, `db -12`, `param 20 5.5`, `bpm 120`, `slot a|b|c <n>`, `toggle`, `tap`, `state`, `names`, `status`, `song next`, `setlist plik.json`, `map 40 20`, `clock on|off`, `osc`, `quit`. Przydatne na próbach (zmiana brzmienia bez schylania się do pedała). `state` pokazuje aktualne sloty/active/bypass/BPM z pamięci mostka.
+
+Tryb headless: przy braku terminala (LaunchAgent, `</dev/null`) mostek **nie kończy się na EOF** — komendy można przesyłać pipą: `echo "state" | .venv/bin/python tonex_bridge.py…`.
 
 ## 12. Config JSON (`--config bridge.json`)
 
@@ -117,6 +121,9 @@ Po starcie mostek przyjmuje komendy z terminala: `help`, `preset 5`, `p 12`, `up
   "channel": 1,
   "note_base": 36,
   "clock_sync": true,
+  "osc_port": 9000,
+  "osc_host": "0.0.0.0",
+  "tap_cc": 10,
   "setlist": "setlist.json",
   "song_next_cc": 84,
   "song_prev_cc": 85,
@@ -124,3 +131,28 @@ Po starcie mostek przyjmuje komendy z terminala: `help`, `preset 5`, `p 12`, `up
 }
 ```
 Flagi CLI wygrywają z configiem.
+
+## OSC — sterowanie z Maxa / touchOSC (UDP 9000)
+
+Dla Ciebie najważniejsze: **OSC z Maxa bez żadnych nowych paczek** (mostek ma własny, minimalny OSC 1.0 na stdlib).
+
+```
+[udpsend 127.0.0.1 9000]  ←  z patchera
+   └─ [sprintf /preset %d]   z intem 0..19
+```
+
+Albo pełny router: `[udpreceive 9000] → [route /preset /toggle /vol /param /status] → [unpack 0 i]…`
+
+- `/preset 12` (int) → wczytaj preset; `/toggle` → przełącz A/B; `/slot 1 9` → preset 9 do slotu B; `/param 20 5.5` → gain; `/vol 0.5`; `/bpm 120`; `/bypass`; `/tap`; `/clock 1`.
+- `/names` i `/status` **odpowiadają** do nadawcy stringiem — np. `[udpreceive 9000]` w m4l pokaże aktualny preset na UI.
+- Domyślnie host `0.0.0.0` → działa touchOSC/tablet w tej samej sieci (bez hasła — sieć domowa/studyjna; wyłącz przez `--no-osc`).
+
+## Feedback — „ToneX Bridge Out" (Live widzi aktualny preset)
+
+Mostek otwiera drugi wirtualny port **„ToneX Bridge Out"** i na każde realne przełączenie wysyła tam `CC 127` = numer presetu + `PC`; na zmianę songu setlisty `CC 84` = index. Zastosowania: mały m4l `[ctlin 127]` → wyświetlacz aktualnego brzmienia; lampka na scenie. Konfiguracja: ten port robisz **MIDI From** na tracku (jak ToneX Bridge, tylko odwrotnie — to wejście do Live).
+
+## A/B slots + tap tempo (lustro footswitcha)
+
+- **CC 124/125** (0..19) → wczytaj preset prosto do slotu A/B; **CC 126** (≥64) → przełącz A/B jak stopą na pedale (natychmiastowy skok na drugi gotowy dźwięk).
+- CLI `slot b 5` / `toggle`; OSC `/slot 1 5` / `/toggle`.
+- **CC 10** (dwie wartości ≥1 w rytmie) → tap tempo: mostek przelicza odstęp na BPM i zapisuje do pedała. Wyłącz: `--tap-cc 0`.

@@ -116,3 +116,48 @@ def note_preset(note: int, base: int | None) -> int | None:
         return None
     i = note - base
     return i if 0 <= i < 20 else None
+
+
+class TapTempo:
+    """Convert tap intervals (CC taps / OSC /tap) into pedal BPM.
+
+    - needs >= 2 taps, gaps > max_gap reset the stream
+    - averages the last up-to-4 taps, rounds to whole BPM
+    - commits only when the BPM moved >= min_change vs last write
+    """
+
+    def __init__(self, max_gap: float = 2.0, min_change: float = 1.0,
+                 bpm_min: float = 40.0, bpm_max: float = 240.0):
+        self.max_gap = max_gap
+        self.min_change = min_change
+        self.bpm_min = bpm_min
+        self.bpm_max = bpm_max
+        self.taps: list[float] = []
+        self.last_tap: float | None = None
+        self.last_written: float | None = None
+
+    def reset(self) -> None:
+        self.taps.clear()
+        self.last_tap = None
+
+    def tap(self, now: float) -> float | None:
+        if self.last_tap is None or (now - self.last_tap) > self.max_gap:
+            self.taps = [now]
+        else:
+            self.taps.append(now)
+            if len(self.taps) > 4:
+                del self.taps[0]
+        self.last_tap = now
+        if len(self.taps) < 2:
+            return None
+        dt = (self.taps[-1] - self.taps[0]) / (len(self.taps) - 1)
+        if dt <= 0:
+            return None
+        bpm = 60.0 / dt
+        b = round(bpm)
+        if not (self.bpm_min <= b <= self.bpm_max):
+            return None
+        if self.last_written is not None and abs(b - self.last_written) < self.min_change:
+            return None
+        self.last_written = b
+        return float(b)

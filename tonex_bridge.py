@@ -8,11 +8,14 @@ Features (SOTA):
   - preset switching: PC 0-19, CC 127 (0-19), CC 86/87, MIDI notes (--note-base)
   - 20 preset names fetched from the pedal at startup, shown in logs
   - MIDI clock → pedal BPM sync (hysteresis; --no-clock to disable)
-  - global volume CC 122, bypass CC 123, BPM CC 88, param CC map
+  - OSC server (/preset /param /slot /toggle /tap … — Max, touchOSC, phones)
+  - A/B slots: mirror the pedal footswitch (loaded A/B presets, CC 124/125/126)
+  - MIDI feedback: virtual "ToneX Bridge Out" reports the current preset
+  - tap tempo (CC 10), global volume CC 122, bypass CC 123, BPM CC 88, param CC map
   - setlist mode (--setlist / CC 84/85 song next/prev)
   - interactive stdin CLI (preset/param/vol/names/song/…)
   - auto-reconnect when the pedal is unplugged/replugged
-  - JSON config file (--config)
+  - JSON config file (--config); launchd LaunchAgent installer
 
 MIDI map (Builty MidiCommands-aligned):
   Program Change 0-19          -> load preset N
@@ -22,6 +25,10 @@ MIDI map (Builty MidiCommands-aligned):
   CC 123 (>=64)                -> bypass toggle
   CC 122 (0-127)               -> global volume (dB scale)
   CC 88  (0-127)               -> BPM (40-240)
+  CC 10                        -> tap tempo
+  CC 124 (0-19)                -> load preset into slot A
+  CC 125 (0-19)                -> load preset into slot B
+  CC 126 (>=64)                -> A/B toggle (footswitch mirror)
   CC 2,5,6,8,18,19,32,37,75,102,103,106,107 -> parameters (tonex.js numbering)
 
 Requires: .venv with pyserial, mido, python-rtmidi.  Run:
@@ -43,12 +50,13 @@ from types import SimpleNamespace
 import serial
 import serial.tools.list_ports
 
-from tonex_features import ClockSync, Setlist, note_preset
+from tonex_features import ClockSync, Setlist, TapTempo, note_preset
+from tonex_osc import OscServer, decode as osc_decode, encode as osc_encode
 from tonex_proto import (
     BAUD, MAX_PRESETS, PARAM_DEFS, PID, VID,
     active_idx, cc_to_value, frame, hello, load_preset_patch, parse_preset_name,
     parse_state, patch_global, req_preset, req_state, send_mvol, send_param,
-    set_state, state_info, unframe,
+    set_slot_patch, set_state, state_info, toggle_slot_patch, unframe,
 )
 
 VIRTUAL_PORT_NAME = "ToneX Bridge"
@@ -75,8 +83,12 @@ CC_SELECT = 127
 CC_PRESET_DOWN = 86
 CC_PRESET_UP = 87
 CC_BPM = 88
+CC_TAP = 10
 CC_GLOBAL_VOL = 122
 CC_BYPASS = 123
+CC_SLOT_A = 124
+CC_SLOT_B = 125
+CC_AB = 126
 
 HELP = """commands:
   preset|p <0-19>          load preset
@@ -86,12 +98,16 @@ HELP = """commands:
   db <-40..3>              global volume in dB
   param <idx> <value>      write parameter (PARAM_DEFS index, real units)
   bpm <40..240>            set pedal BPM
+  tap                      tap tempo
+  slot a|b|c <0-19>        load preset into a slot (A/B/C)
+  toggle                   A/B toggle (footswitch mirror)
   names                    list preset names
   status                   bridge + pedal status
   song next|prev|goto <i>  setlist navigation
   setlist <file>           load a setlist JSON
   map <cc> <param>         map CC to parameter index
   clock on|off             toggle MIDI clock -> BPM sync
+  osc                      show OSC endpoint
   help | quit              this text / exit"""
 
 
@@ -109,6 +125,9 @@ class TonexDevice:
         self.failed = False
         self._names: list[str | None] | None = None
         self._name_queue: "queue.deque[int]" = __import__("collections").deque()
+        self.on_preset_change = None   # callable(preset_idx) after a real switch
+        self._state_lock = threading.Lock()   # serializes set_state writes + echoes
+        self._expect_state = False
 
     # ---- lifecycle ----------------------------------------------------
     def open(self) -> None:
@@ -174,6 +193,8 @@ class TonexDevice:
                 sd = parse_state(payload)
                 if sd:
                     self.state = sd
+                    if self._expect_state:
+                        self._expect_state = False
                     if self.verbose:
                         info = state_info(sd)
                         print(f"  [state] len={len(sd)} slotA={info['slot_a']} "
@@ -210,14 +231,29 @@ class TonexDevice:
         return self._names
 
     # ---- commands -----------------------------------------------------
+    def _write_state(self, patched: bytes) -> None:
+        """Write a full state patch, paced by the pedal's async reply so a
+        burst of writes cannot read a stale state in between (each echo is
+        consumed before the next write goes out). Applies optimistically on
+        timeout — the local patch is the authority either way."""
+        with self._state_lock:
+            self._expect_state = True
+            self.state = patched
+            self.write(set_state(patched))
+            deadline = time.monotonic() + 1.0
+            while self._expect_state and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self._expect_state = False
+
     def load_preset(self, n: int, toggle_on_repeat: bool = False) -> str | None:
         if self.state is None:
             return None
         patched = load_preset_patch(self.state, n, toggle_on_repeat)
         if patched is None:
             return f"preset {n} already active (skip)"
-        self.write(set_state(patched))
-        self.state = patched
+        self._write_state(patched)
+        if self.on_preset_change:
+            self.on_preset_change(n)
         return f"preset -> {n}"
 
     def set_param(self, idx: int, value: float) -> str | None:
@@ -232,8 +268,7 @@ class TonexDevice:
         patched = patch_global(self.state, idx, value)
         if patched is None:
             return None
-        self.write(set_state(patched))
-        self.state = patched
+        self._write_state(patched)
         return f"global {idx} {PARAM_DEFS[idx][0]} = {value:.2f}"
 
     def preset_step(self, delta: int) -> str | None:
@@ -248,9 +283,31 @@ class TonexDevice:
         sd = bytearray(self.state)
         sd[-12] = 1 - sd[-12]
         sd[-7] = 1
-        self.write(set_state(bytes(sd)))
-        self.state = bytes(sd)
+        self._write_state(bytes(sd))
         return "bypass toggle"
+
+    def set_slot(self, slot: int, n: int) -> str | None:
+        """Load preset n into slot A/B/C (0/1/2); switches sound if slot is active."""
+        if self.state is None:
+            return None
+        p = set_slot_patch(self.state, slot, n)
+        if p is None:
+            return f"slot {'ABC'[slot]} already preset {n}"
+        self._write_state(p)
+        if slot == self.state[-11] and self.on_preset_change:
+            self.on_preset_change(n)
+        return f"slot {'ABC'[slot]} -> {n}"
+
+    def toggle_ab(self) -> str | None:
+        """A/B footswitch mirror: flip the active slot between A and B."""
+        if self.state is None:
+            return None
+        p = toggle_slot_patch(self.state)
+        self._write_state(p)
+        n = active_idx(self.state)
+        if self.on_preset_change:
+            self.on_preset_change(n)
+        return f"A/B toggle -> preset {n} (slot {'ABC'[self.state[-11]]})"
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +398,18 @@ def handle_midi_msg(msg, ctx) -> str | None:
             return f"CC127 {v} out of range"
         r = dev.load_preset(v)
         return f"{r}{pname(ctx, v)}" if r else None
+    if c == ctx.tap_cc and ctx.tap_cc and v >= 1:
+        b = ctx.tap.tap(time.monotonic())
+        if b is None:
+            return None
+        r = dev.set_param(110, b)
+        return f"tap -> {r}" if r else None
+    if c == CC_SLOT_A and v < MAX_PRESETS:
+        return dev.set_slot(0, v)
+    if c == CC_SLOT_B and v < MAX_PRESETS:
+        return dev.set_slot(1, v)
+    if c == CC_AB and v >= 64:
+        return dev.toggle_ab()
     if c == CC_PRESET_DOWN and v >= 64:
         return dev.preset_step(-1)
     if c == CC_PRESET_UP and v >= 64:
@@ -370,7 +439,89 @@ def song_nav(ctx, direction: str) -> str | None:
         return "setlist empty"
     song, preset = r
     ctx.dev.load_preset(preset)
+    fb = getattr(ctx, "fb", None)
+    if fb is not None:
+        try:
+            fb.send(__import__("mido").Message("control_change", control=84, value=ctx.setlist.idx))
+        except Exception:  # noqa: BLE001
+            pass
     return f"song -> [{ctx.setlist.idx}] {song} (preset {preset})"
+
+
+def handle_osc(path: str, args: list, ctx) -> bytes | None:
+    """OSC endpoint: /preset /param /vol /db /bpm /bypass /up /down /slot /toggle
+    /tap /song /setlist /clock /names /status. Actions log via ctx.log;
+    /names and /status reply with an OSC-encoded string.
+
+    OSC wire format: big-endian, ints/floats/strings (tonex_osc.encode).
+    """
+    p = path.strip("/").lower()
+    dev = ctx.dev
+    line = None
+    reply = None
+    try:
+        if p == "preset" and args:
+            n = int(args[0])
+            r = dev.load_preset(n)
+            line = f"{r}{pname(ctx, n)}" if r else None
+        elif p == "param" and len(args) >= 2:
+            line = dev.set_param(int(args[0]), float(args[1]))
+        elif p == "vol" and args:
+            line = dev.set_param(116, -40.0 + 43.0 * max(0.0, min(1.0, float(args[0]))))
+        elif p == "db" and args:
+            line = dev.set_param(116, float(args[0]))
+        elif p == "bpm" and args:
+            line = dev.set_param(110, float(args[0]))
+        elif p == "bypass":
+            line = dev.toggle_bypass()
+        elif p in ("up", "down"):
+            line = dev.preset_step(1 if p == "up" else -1)
+        elif p == "slot" and len(args) >= 2:
+            line = dev.set_slot(int(args[0]), int(args[1]))
+        elif p == "toggle":
+            line = dev.toggle_ab()
+        elif p == "tap":
+            b = ctx.tap.tap(time.monotonic())
+            if b is not None:
+                line = dev.set_param(110, b)
+        elif p == "song" and args:
+            act = str(args[0]).lower()
+            if act == "next":
+                line = song_nav(ctx, "next")
+            elif act == "prev":
+                line = song_nav(ctx, "prev")
+            elif act == "goto" and len(args) >= 2 and ctx.setlist:
+                r = ctx.setlist.goto(int(args[1]))
+                if r:
+                    song, preset = r
+                    ctx.dev.load_preset(preset)
+                    line = f"song -> [{ctx.setlist.idx}] {song} (preset {preset})"
+        elif p == "setlist" and args:
+            ctx.setlist = Setlist.load(str(args[0]))
+            line = f"setlist loaded: {len(ctx.setlist.entries)} songs"
+        elif p == "clock" and args:
+            ctx.clock_on = bool(int(args[0]))
+            line = f"clock sync: {'on' if ctx.clock_on else 'off'}"
+        elif p == "names":
+            names = ctx.names or []
+            joined = " | ".join(names[i] or "(no name)" for i in range(MAX_PRESETS))
+            reply = osc_encode("/names", [joined])
+        elif p == "status":
+            if dev.state is None:
+                reply = osc_encode("/status", ["no pedal state"])
+            else:
+                inf = state_info(dev.state)
+                a = inf["active"]
+                reply = osc_encode("/status", [
+                    f"preset {a} (slot {'ABC'[inf['current_slot']]}){pname(ctx, a)}"
+                    f"  bpm {inf['bpm']:.1f}  bypass {inf['bypass']}"])
+        else:
+            line = f"osc unknown: {path}"
+    except Exception as e:  # noqa: BLE001
+        line = f"osc error: {e}"
+    if line:
+        ctx.log(line)
+    return reply
 
 
 def run_command(line: str, ctx) -> list[str]:
@@ -410,6 +561,34 @@ def run_command(line: str, ctx) -> list[str]:
         out.append(str(dev.set_param(int(t[1]), float(t[2]))))
     elif op == "bpm":
         out.append(str(dev.set_param(110, float(t[1]))))
+    elif op == "tap":
+        b = ctx.tap.tap(time.monotonic())
+        if b is not None:
+            out.append(str(dev.set_param(110, b)) + f"  (tap {b:.0f} BPM)")
+        else:
+            out.append("tap: need another tap")
+    elif op == "slot":
+        slot = {"a": 0, "b": 1, "c": 2}.get(t[1].lower())
+        if slot is None or len(t) < 3:
+            out.append("usage: slot a|b|c <0-19>")
+        else:
+            out.append(str(dev.set_slot(slot, int(t[2]))))
+    elif op == "toggle":
+        out.append(str(dev.toggle_ab()))
+    elif op == "state":
+        if dev.state is None:
+            out.append("no pedal state")
+        else:
+            inf = state_info(dev.state)
+            out.append(f"state: A={inf['slot_a']} B={inf['slot_b']} C={inf['slot_c']} "
+                       f"cur={'ABC'[inf['current_slot']]} active={inf['active']} "
+                       f"bypass={inf['bypass']} bpm={inf['bpm']}")
+    elif op == "osc":
+        if getattr(ctx, "osc_port", None):
+            out.append(f"osc endpoint: udp://{ctx.osc_host}:{ctx.osc_port}  "
+                       f"(/preset /param /slot /toggle /tap /names /status)")
+        else:
+            out.append("osc disabled")
     elif op == "names":
         if not ctx.names:
             out.append("no names (pedal names unavailable)")
@@ -459,6 +638,19 @@ def run_command(line: str, ctx) -> list[str]:
     return [o for o in out if o]
 
 
+def feedback_preset(ctx, n: int) -> None:
+    """Emit the current preset on the virtual feedback output (if enabled)."""
+    fb = getattr(ctx, "fb", None)
+    if fb is None:
+        return
+    try:
+        import mido as _m
+        fb.send(_m.Message("control_change", control=CC_SELECT, value=n))
+        fb.send(_m.Message("program_change", program=n))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def reconnect(dev: TonexDevice, serial_arg: str | None) -> bool:
     dev.close()
     port = serial_arg or find_tonex_port()
@@ -497,6 +689,10 @@ def main() -> int:
     ap.add_argument("--clock-sync", dest="clock_sync", default=None, action="store_true",
                     help="MIDI clock -> pedal BPM (default, unless --no-clock)")
     ap.add_argument("--no-clock", dest="clock_sync", action="store_false", help="disable clock sync")
+    ap.add_argument("--osc-port", type=int, default=9000, help="OSC UDP port (0/-no-osc disables)")
+    ap.add_argument("--no-osc", dest="osc", action="store_false", default=True, help="disable OSC server")
+    ap.add_argument("--osc-host", default="0.0.0.0", help="OSC bind host (0.0.0.0 for LAN/touchOSC)")
+    ap.add_argument("--tap-cc", type=int, default=CC_TAP, help="tap tempo CC (0 disables)")
     ap.add_argument("--setlist", help="JSON setlist: [{\"song\":..., \"preset\":...}]")
     ap.add_argument("--song-next-cc", type=int, default=84)
     ap.add_argument("--song-prev-cc", type=int, default=85)
@@ -561,6 +757,7 @@ def main() -> int:
         return 1
 
     dev = TonexDevice(port, verbose=args.verbose)
+    osc = None
     try:
         dev.open()
         print(f"serial  : {port}")
@@ -585,20 +782,50 @@ def main() -> int:
 
         setlist = Setlist.load(args.setlist) if args.setlist else None
         song_ccs = {"next": args.song_next_cc, "prev": args.song_prev_cc} if setlist else {}
+
+        def log(line: str) -> None:
+            print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+
+        # virtual MIDI feedback output (Live/Max see the current preset)
+        fb = None
+        try:
+            fb = mido.open_output(VIRTUAL_PORT_NAME + " Out", virtual=True)
+            print(f"feedback: {VIRTUAL_PORT_NAME} Out (virtual MIDI output)")
+        except Exception:  # noqa: BLE001
+            pass
+
         ctx = SimpleNamespace(
             dev=dev, param_cc=param_cc, names=names, note_base=args.note_base,
             channel=args.channel, clock_on=bool(args.clock_sync),
             clock=ClockSync(), last_clock=0.0, done=False,
             setlist=setlist, song_ccs=song_ccs,
+            tap=TapTempo(), tap_cc=args.tap_cc, fb=fb, log=log,
+            osc_host=args.osc_host, osc_port=None,
         )
+        dev.on_preset_change = lambda n: feedback_preset(ctx, n)
+
+        if args.osc and args.osc_port > 0:
+            def osc_handler(path, argv, addr):
+                return handle_osc(path, argv, ctx)
+            osc = OscServer(args.osc_port, osc_handler, host=args.osc_host)
+            osc.start()
+            ctx.osc_port = osc.bound_port
+            print(f"osc      : udp://{args.osc_host}:{ctx.osc_port}  "
+                  f"(/preset /param /slot /toggle /tap /names /status)")
+        else:
+            osc = None
+            print("osc      : disabled")
 
         print(f"clock    : {'on (MIDI clock -> BPM)' if ctx.clock_on else 'off'}"
+              f"   tap: {('CC ' + str(args.tap_cc)) if args.tap_cc else 'off'}"
               f"   notes: {('on (base ' + str(args.note_base) + ')') if args.note_base is not None else 'off'}"
               f"   setlist: {len(setlist.entries) if setlist else 0} songs"
               + (f" (CC {args.song_next_cc}/{args.song_prev_cc} song next/prev)" if setlist else ""))
         print("--- bindings ---")
         print("  PC 0-19 | CC 127 0-19   -> load preset")
         print(f"  CC {CC_PRESET_DOWN}/{CC_PRESET_UP}             -> preset down/up")
+        print(f"  CC {CC_TAP}                  -> tap tempo")
+        print(f"  CC {CC_SLOT_A}/{CC_SLOT_B}/{CC_AB}               -> slot A/B load, A/B toggle")
         print(f"  CC {CC_BYPASS}                -> bypass toggle")
         print(f"  CC {CC_GLOBAL_VOL}               -> global volume")
         print(f"  CC {CC_BPM}                -> BPM")
@@ -606,9 +833,6 @@ def main() -> int:
             print(f"  CC {cc:<3}                -> {name} (param {idx})")
         print("  type 'help' for the interactive CLI")
         print("---")
-
-        def log(line: str) -> None:
-            print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
 
         cmd_q: queue.Queue = queue.Queue()
 
@@ -622,8 +846,10 @@ def main() -> int:
                 if select.select([sys.stdin], [], [], 0)[0]:
                     line = sys.stdin.readline()
                     if not line:                      # EOF (piped)
-                        ctx.done = True
-                        break
+                        if sys.stdin.isatty():         # real terminal: quit
+                            ctx.done = True
+                            break
+                        continue                      # headless: ignore EOF
                     for o in run_command(line, ctx):
                         log(o)
                 # MIDI
@@ -656,6 +882,8 @@ def main() -> int:
         print("\nbye")
     finally:
         dev.close()
+        if osc is not None:
+            osc.stop()
     return 0
 
 

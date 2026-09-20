@@ -103,8 +103,8 @@ Pełna tabela w README; kluczowe: `PC 0-19` / `CC 127 0-19` → preset, `CC 86/8
 
 ## 9. Weryfikacja
 
-- Wektory byte-exact: `test_proto.py` (10 testów) vs PyTonexControl + `node scripts/gen_vectors.js`.
-- Na żywo (Twój pedał, `/dev/cu.usbmodem211401`): sync stanu 164 B ✅, przełączenie 16↔17 z potwierdzeniem pedała ✅, E2E przez prawdziwy IAC (PC 3, CC127=8, PC 16 restore) ✅.
+- Wektory byte-exact: `test_proto.py` (10) + `test_features.py` (17) + `test_osc.py` (9) = **36/36** vs PyTonexControl + `node scripts/gen_vectors.js` + round-trip OSC.
+- Na żywo (Twój pedał, `/dev/cu.usbmodem211401`): sync stanu 164 B ✅, przełączenie 16↔17 z potwierdzeniem ✅, E2E przez IAC ✅, OSC `/preset 5` ✅, feedback CC127 odczytany na „ToneX Bridge Out" ✅, A/B toggle A→B→A ✅, tap tempo → BPM 119 ✅, pedał przywrócony bit-w-bit po testach ✅.
 - Mostek leci w jednym procesie, bez GUI; Ctrl+C = czyste zamknięcie portu.
 
 ## 10. Nazwy presetów
@@ -122,6 +122,41 @@ Odpowiedź na `req_preset(i)` zawiera blok nazwy: marker `B9 04 B9 02 BC 21` + 3
 
 - **Setlist**: `[{"song","preset"}]`; CC 84/85 (konfigurowalne) + CLI `song next|prev|goto`; przeładowanie w locie `setlist <plik>`.
 - **Noty**: `--note-base N` — note-on z zakresu N..N+19 → preset; tylko dedicated channel (izolacja od melodii).
-- **CLI (stdin)**: `preset/p | up | down | bypass | vol | db | param <idx> <val> | bpm | names | status | song | setlist | map <cc> <param> | clock | help | quit`.
+- **CLI (stdin)**: `preset/p | up | down | bypass | vol | db | param <idx> <val> | bpm | slot a|b|c <n> | toggle | tap | state | names | status | song | setlist | map <cc> <param> | clock | osc | help | quit`.
 - **Reconnect**: `write()` ustawia `failed` przy błędzie serialu (np. odpięcie USB); pętla główna próbuje ponownie co 1,5 s (re-open + re-sync + re-fetch nazw) — bez restartu mostka. Reader ma backoff 50 ms, żeby nie kręcić CPU na odpiętym urządzeniu.
 - **Wirtualny port**: `mido.open_input("ToneX Bridge", virtual=True)` — CoreMIDI destination widoczny dla Abletona; fallback na IAC.
+
+## 13. Serializacja zapisów stanu (`_write_state`)
+
+Pedał odpowiada na każde `set_state` **asynchronicznie** pełnym stanem. Przy serii zapisów (np. szybkie zmiany presetów z OSC+MIDI naraz) stara odpowiedź mogła nadpisać nowszy stan — zapis N wykonywał się na stanie sprzed zapisu N-1 (zaobserwowane na żywo jako „slot A = 7" tuż po zapisie „= 0"). Fix: **każdy zapis stanu idzie przez `_write_state`** — lock + optymistyczne ustawienie `self.state` + pauza do momentu, aż reader dostanie echo pedała (max 1 s, potem lokalny patch jest autorytetem). Efekt: zapisy są w pełni serialne i każdy kolejny widzi stan po poprzednim. Na żywo: seria CC124 + /slot + toggle + toggle → końcowy stan pedała zgodny bit-w-bit z oczekiwanym.
+
+## 14. OSC (UDP 9000, `tonex_osc.py`)
+
+Własny, minimalny OSC 1.0 na samym stdlib (big-endian, stringi NUL-terminowane + padding do 4 B — ważne przy ścieżkach/stringach o długości wielokrotności 4, np. `/bpm`; pokryte testami wektorowymi). Serwer: osobny wątek, `recvfrom` z timeoutem 0,2 s, odporność na śmieciowe datagramy.
+
+| Ścieżka | Argumenty | Akcja / odpowiedź |
+|---|---|---|
+| `/preset` | `i` | load_preset |
+| `/param` | `i i,f` | set_param |
+| `/vol` / `/db` | `f` | global volume % / dB |
+| `/bpm` | `f` | global 110 |
+| `/slot` | `i i` | set_slot (0/1/2) |
+| `/toggle` | — | toggle_ab |
+| `/bypass` / `/up` / `/down` / `/tap` | — | jak CLI |
+| `/song next/prev` | — | setlist navigation |
+| `/clock` | `i` | sync on/off |
+| `/names` | — | **reply** (jeden string 20 nazw, `|`) |
+| `/status` | — | **reply** (preset, slot, bpm, bypass) |
+
+Odpowiedzi wracają na adres nadawcy (zapamiętany z `recvfrom`). Host domyślny `0.0.0.0` (LAN/touchOSC), port `--osc-port` (0/`--no-osc` wyłącza). Typy: tylko `i`/`f`/`s` — wystarczające dla tej powierzchni; nieznane ścieżki logują `osc unknown`.
+
+## 15. Feedback i A/B slots
+
+- **`ToneX Bridge Out`** (drugi wirtualny port, `virtual=True`): na każde realne przełączenie (`on_preset_change` — wywoływany z `load_preset`/`set_slot`/`toggle_ab` przy faktycznej zmianie) wysyła `CC 127` = preset + `PC`; `song_nav` dokłada `CC 84` = idx utworu. To sprzężenie zwrotne — Live/m4l widzą aktualny dźwięk niezależnie od źródła sterowania.
+- **Sloty A/B/C** = „szuflady" z gotowymi presetami (state: `sd[-18]/-16/-14]`, `cur` = `sd[-11]`): `set_slot_patch` podmienia tylko bajt wskazanego slotu (+DMON), `toggle_slot_patch` odwraca `cur` 0↔1 — identycznie jak footswitch TONEX One. Przełączenie A/B nie wymaga podmiany presetu — pedał skacze na drugi załadowany dźwięk.
+- **Tap tempo**: `TapTempo` (okno 2 s, min. zmiana 1 BPM, zakres 40–240) — odstęp ostatnich 2-4 tapsów CC10 → zapis globalnego BPM (trwały!). CLI `tap`, OSC `/tap`.
+
+## 16. Headless + LaunchAgent
+
+- EOF na stdin (pipa, `</dev/null`, LaunchAgent) **nie kończy mostka**, gdy stdin nie jest TTY — to tryb serwerowy: sterowanie wyłącznie MIDI/OSC i przez pipę (`echo "state" | …tonex_bridge.py…`). Przy prawdziwym terminalu EOF = quit jak dotąd.
+- `scripts/install-launchagent.sh` — template `com.pawelknorps.tonex-bridge.plist` (podmiana ścieżek venv/bridge/logów) + `launchctl bootstrap`; `RunAtLoad` + `KeepAlive` → mostek wstaje przy logowaniu i restartuje się po crashu; logi `~/Library/Logs/tonex-bridge*.log`. Bez pedała mostek czeka w auto-reconnect.
