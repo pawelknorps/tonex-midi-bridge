@@ -14,6 +14,8 @@ Ableton ──MIDI──> "ToneX Bridge" (wirtualny port, zero konfiguracji!) �
 - **Przełączanie presetów**: PC 0-19, CC 127 (0-19), CC 86/87 up/down, **noty MIDI** (pady: `--note-base`)
 - **Wirtualne wyjście feedback „ToneX Bridge Out"** — na każde realne przełączenie wysyła `CC 127` (preset) + `PC`, a na song `CC 84` → Live/Max pokazuje aktualny dźwięk
 - **A/B slots (lustro footswitcha)** — `slot A/B/C`, `toggle` (CC 124/125/126): dwa gotowe brzmienia z przełączaniem jednym komunikatem
+- **Snapshot A/B stanu** — `snapshot save/recall/swap` (CLI + OSC): zapisz cały stan pedała (sloty, bypass, globalsy, BPM) i cofnij eksperymenty jednym poleceniem
+- **Nazwy presetów w logach** — `preset -> 5 [My Preset 222]`, `A/B toggle -> preset 8 (slot B) [RawMod '64  Custom Deluxe TOP1]`
 - **Tap tempo (CC 10)** — nastukaj tempo na padzie, BPM pedała ustawia się sam
 - **OSC (UDP, czysty stdlib, port 9000)** — `/preset /param /slot /toggle /tap /names /status` z Maxa, touchOSC, telefonu; host 0.0.0.0 (LAN)
 - **Nazwy presetów** — 20 nazw pobieranych z pedała na starcie, pokazywane w logach i `--list-presets`
@@ -36,9 +38,11 @@ Przetestowane na prawdziwym TONEX One (`/dev/cu.usbmodem211401`):
 - setlist CC84 → „Outro"; CLI `names`/`status`/`bpm` działają
 - **OSC `/preset 5` → pedał na „My Preset 222"** + **feedback `CC 127=5` odebrany na „ToneX Bridge Out"** w innym procesie
 - **A/B toggle: slot A→B→A z powrotem ma dokładny preset** (lustro footswitcha); **CC 124 slot A:=7** działa
+- **snapshot save/recall przez OSC: 100% undo całego stanu** (sloty+cur+BPM) — przywrócone dokładnie
+- **nazwy presetów w logach toggle/slot** (`[Dream 65 - JJ´s Clean BEST1]`, `[RawMod '64 Custom Deluxe TOP1]`)
 - **tap tempo CC 10 → BPM pedała 119** (potem 45.42… przywrócone bit-w-bit)
 - po testach pedał **przywrócony w 100%** (sloty A/B/C, active slot, bypass, BPM) — weryfikowane stanem z pedała
-- testy: `test_proto.py` **10/10** + `test_features.py` **17/17** + `test_osc.py` **9/9** = **36/36**
+- testy: `test_proto.py` **10/10** + `test_features.py` **18/18** + `test_osc.py` **9/9** + `test_device.py` **6/6** = **43/43**
 
 ## Dokumentacja
 
@@ -120,6 +124,7 @@ Minimalny serwer OSC (UDP, czysty stdlib — zero nowych zależności). Domyśln
 | `/tap` | — | tap tempo |
 | `/song next` `/song prev` | — | setlist (jeśli załadowany) |
 | `/clock` | `i` | 1/0 = włącz/wyłącz sync BPM |
+| `/snapshot save|recall|swap|list` | `s` [+`i`] | stan pedała: zapisz/przywróć/swapnij/wypisz |
 | `/names` | — | **odpowiada** listą 20 nazw (`s`) |
 | `/status` | — | **odpowiada** stringiem stanu (preset, slot, bpm, bypass) |
 
@@ -176,7 +181,7 @@ Agent startuje mostek przy logowaniu (`RunAtLoad`) i trzyma go żywym (`KeepAliv
 - `tonex_bridge.py` — mostek: serial + MIDI + OSC + CLI + feedback
 - `tonex_features.py` — czysta logika: ClockSync, Setlist, TapTempo, noty
 - `tonex_osc.py` — minimalny OSC 1.0 (encode/decode + UDP server, stdlib)
-- `test_proto.py` / `test_features.py` / `test_osc.py` — testy (36)
+- `test_proto.py` / `test_features.py` / `test_osc.py` / `test_device.py` — testy (43)
 - `scripts/gen_vectors.js` — generator ground truth z tonex.js (node)
 - `scripts/install-launchagent.sh` — auto-start macOS (+ plist template)
 

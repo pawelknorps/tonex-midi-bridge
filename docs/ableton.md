@@ -108,7 +108,9 @@ Mostek słucha **dowolnego** wejścia MIDI:
 
 ## 11. Interaktywny CLI (stdin)
 
-Po starcie mostek przyjmuje komendy z terminala: `help`, `preset 5`, `p 12`, `up`/`down`, `bypass`, `vol 0.5`, `db -12`, `param 20 5.5`, `bpm 120`, `slot a|b|c <n>`, `toggle`, `tap`, `state`, `names`, `status`, `song next`, `setlist plik.json`, `map 40 20`, `clock on|off`, `osc`, `quit`. Przydatne na próbach (zmiana brzmienia bez schylania się do pedała). `state` pokazuje aktualne sloty/active/bypass/BPM z pamięci mostka.
+Po starcie mostek przyjmuje komendy z terminala: `help`, `preset 5`, `p 12`, `up`/`down`, `bypass`, `vol 0.5`, `db -12`, `param 20 5.5`, `bpm 120`, `slot a|b|c <n>`, `toggle`, `snapshot save|recall|swap|list`, `tap`, `state`, `names`, `status`, `song next`, `setlist plik.json`, `map 40 20`, `clock on|off`, `osc`, `quit`. Przydatne na próbach (zmiana brzmienia bez schylania się do pedała). `state` pokazuje aktualne sloty/active/bypass/BPM z pamięci mostka.
+
+**Snapshot = cofnij wszystko**: grałeś parametry/gain i chcesz wrócić do dźwięku sprzed 5 minut? `snapshot save 1` przed eksperymentem, potem `snapshot recall 1` — przywraca cały stan pedała (sloty, bypass, globalsy, BPM) dokładnie. `snapshot swap` zamienia dwa zapisane (brzmienie A/B).
 
 Tryb headless: przy braku terminala (LaunchAgent, `</dev/null`) mostek **nie kończy się na EOF** — komendy można przesyłać pipą: `echo "state" | .venv/bin/python tonex_bridge.py…`.
 
@@ -143,7 +145,7 @@ Dla Ciebie najważniejsze: **OSC z Maxa bez żadnych nowych paczek** (mostek ma 
 
 Albo pełny router: `[udpreceive 9000] → [route /preset /toggle /vol /param /status] → [unpack 0 i]…`
 
-- `/preset 12` (int) → wczytaj preset; `/toggle` → przełącz A/B; `/slot 1 9` → preset 9 do slotu B; `/param 20 5.5` → gain; `/vol 0.5`; `/bpm 120`; `/bypass`; `/tap`; `/clock 1`.
+- `/preset 12` (int) → wczytaj preset; `/toggle` → przełącz A/B; `/slot 1 9` → preset 9 do slotu B; `/param 20 5.5` → gain; `/vol 0.5`; `/bpm 120`; `/bypass`; `/tap`; `/clock 1`; `/snapshot save 1` / `/snapshot recall 1` / `/snapshot swap` / `/snapshot list`.
 - `/names` i `/status` **odpowiadają** do nadawcy stringiem — np. `[udpreceive 9000]` w m4l pokaże aktualny preset na UI.
 - Domyślnie host `0.0.0.0` → działa touchOSC/tablet w tej samej sieci (bez hasła — sieć domowa/studyjna; wyłącz przez `--no-osc`).
 

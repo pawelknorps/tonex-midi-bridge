@@ -131,6 +131,21 @@ class StubDev:
         self.last = ("ab",)
         return "A/B toggle"
 
+    def snapshot_save(self, slot):
+        self.last = ("snap", "save", slot)
+        return f"snapshot {slot} saved (A=0 B=8 cur=A bpm=45.0)"
+
+    def snapshot_recall(self, slot):
+        self.last = ("snap", "recall", slot)
+        return f"snapshot {slot} recalled (A=0 B=8 cur=A preset 0 bpm=45.0)"
+
+    def snapshot_swap(self):
+        self.last = ("snap", "swap")
+        return "snapshots 1 <-> 2 swapped"
+
+    def snapshot_list(self):
+        return ["  1: A=0 B=8 C=12 cur=A bypass=0 bpm=45.0"]
+
 
 def _mkctx(note_base=None, clock_on=False, setlist=None, tap_cc=10):
     import tonex_bridge as tb
@@ -289,6 +304,35 @@ def test_osc_route():
     assert reply is not None and decode(reply)[0] == "/names"
     reply = tb.handle_osc("/status", [], ctx)
     assert reply is not None and "preset" in decode(reply)[1][0]
+
+
+def test_osc_snapshot_and_names():
+    import tonex_bridge as tb
+    from tonex_osc import decode
+
+    ctx = _mkctx()
+    logs = []
+    ctx.log = logs.append
+    ctx.names = ["Alpha One", None] + ["(no name)"] * 18
+
+    # ename appends the preset name to slot/toggle lines
+    assert tb.ename(ctx, "A/B toggle -> preset 0 (slot A)") == "A/B toggle -> preset 0 (slot A) [Alpha One]"
+    assert tb.ename(ctx, "A/B toggle -> preset 1 (slot B)") == "A/B toggle -> preset 1 (slot B)"
+    assert tb.ename(ctx, None) is None
+
+    tb.handle_osc("/snapshot", ["save", 1], ctx)
+    assert ctx.dev.last == ("snap", "save", 1)
+    tb.handle_osc("/snapshot", ["recall", 1], ctx)
+    assert ctx.dev.last == ("snap", "recall", 1)
+    assert "Alpha One" in logs[-1]                        # name in recall log
+    tb.handle_osc("/snapshot", ["swap"], ctx)
+    assert ctx.dev.last == ("snap", "swap")
+    reply = tb.handle_osc("/snapshot", ["list"], ctx)
+    assert reply is None and logs[-1].startswith("snapshots:")
+    # routes
+    assert tb.run_command("snapshot save 2", ctx)[0].startswith("snapshot 2 saved")
+    assert tb.run_command("snapshot list", ctx)[0].startswith("  1:")
+    assert tb.run_command("snapshot", ctx)[0].startswith("usage:")
 
 
 if __name__ == "__main__":

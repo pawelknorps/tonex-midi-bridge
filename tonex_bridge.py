@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import re
 import select
 import shlex
 import sys
@@ -101,6 +102,10 @@ HELP = """commands:
   tap                      tap tempo
   slot a|b|c <0-19>        load preset into a slot (A/B/C)
   toggle                   A/B toggle (footswitch mirror)
+  snapshot save <0-9>      save pedal state (all slots + globals) to a slot
+  snapshot recall <0-9>    restore a saved state (undo experiments instantly)
+  snapshot swap            exchange snapshots 1 <-> 2 (sound A/B)
+  snapshot list            show saved snapshots
   names                    list preset names
   status                   bridge + pedal status
   song next|prev|goto <i>  setlist navigation
@@ -128,6 +133,7 @@ class TonexDevice:
         self.on_preset_change = None   # callable(preset_idx) after a real switch
         self._state_lock = threading.Lock()   # serializes set_state writes + echoes
         self._expect_state = False
+        self.snapshots: dict[int, bytes] = {}   # state snapshots (0-9)
 
     # ---- lifecycle ----------------------------------------------------
     def open(self) -> None:
@@ -309,6 +315,48 @@ class TonexDevice:
             self.on_preset_change(n)
         return f"A/B toggle -> preset {n} (slot {'ABC'[self.state[-11]]})"
 
+    # ---- snapshots (undo / A-B of the whole pedal state) ---------------
+    def snapshot_save(self, slot: int) -> str | None:
+        """Copy the live pedal state (slots A/B/C, bypass, globals, BPM)."""
+        if self.state is None:
+            return None
+        if not (0 <= slot <= 9):
+            return f"snapshot slot {slot} out of range (0-9)"
+        self.snapshots[slot] = bytes(self.state)
+        inf = state_info(self.state)
+        return (f"snapshot {slot} saved (A={inf['slot_a']} B={inf['slot_b']} "
+                f"cur={'ABC'[inf['current_slot']]} bpm={inf['bpm']:.1f})")
+
+    def snapshot_recall(self, slot: int) -> str | None:
+        """Restore a saved state — exact undo of preset/slot/global changes."""
+        sd = self.snapshots.get(slot)
+        if sd is None:
+            return f"snapshot {slot} missing"
+        self._write_state(sd)
+        if self.state is None:
+            return None
+        n = active_idx(self.state)
+        if self.on_preset_change:
+            self.on_preset_change(n)
+        inf = state_info(self.state)
+        return (f"snapshot {slot} recalled (A={inf['slot_a']} B={inf['slot_b']} "
+                f"cur={'ABC'[inf['current_slot']]} preset {n} bpm={inf['bpm']:.1f})")
+
+    def snapshot_swap(self) -> str | None:
+        if 1 not in self.snapshots or 2 not in self.snapshots:
+            return "snapshots 1 and 2 needed for swap"
+        self.snapshots[1], self.snapshots[2] = self.snapshots[2], self.snapshots[1]
+        return "snapshots 1 <-> 2 swapped"
+
+    def snapshot_list(self) -> list[str]:
+        out = []
+        for i, sd in sorted(self.snapshots.items()):
+            inf = state_info(sd)
+            out.append(f"  {i}: A={inf['slot_a']} B={inf['slot_b']} C={inf['slot_c']} "
+                       f"cur={'ABC'[inf['current_slot']]} bypass={inf['bypass']} "
+                       f"bpm={inf['bpm']:.1f}")
+        return out
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -351,7 +399,19 @@ def open_midi_input(args, mido) -> tuple[object, str]:
 
 def pname(ctx, n: int) -> str:
     nm = ctx.names[n] if ctx.names and ctx.names[n] else None
-    return f"  [{nm}]" if nm else ""
+    return f" [{nm}]" if nm else ""
+
+
+def ename(ctx, line: str | None) -> str | None:
+    """Append the preset name to log lines mentioning 'preset N'."""
+    if not line:
+        return line
+    m = re.search(r"preset (\d+)", line)
+    if m:
+        nm = pname(ctx, int(m.group(1)))
+        if nm:
+            line = f"{line} {nm.lstrip()}"
+    return line
 
 
 def handle_midi_msg(msg, ctx) -> str | None:
@@ -405,11 +465,11 @@ def handle_midi_msg(msg, ctx) -> str | None:
         r = dev.set_param(110, b)
         return f"tap -> {r}" if r else None
     if c == CC_SLOT_A and v < MAX_PRESETS:
-        return dev.set_slot(0, v)
+        return ename(ctx, dev.set_slot(0, v))
     if c == CC_SLOT_B and v < MAX_PRESETS:
-        return dev.set_slot(1, v)
+        return ename(ctx, dev.set_slot(1, v))
     if c == CC_AB and v >= 64:
-        return dev.toggle_ab()
+        return ename(ctx, dev.toggle_ab())
     if c == CC_PRESET_DOWN and v >= 64:
         return dev.preset_step(-1)
     if c == CC_PRESET_UP and v >= 64:
@@ -477,9 +537,20 @@ def handle_osc(path: str, args: list, ctx) -> bytes | None:
         elif p in ("up", "down"):
             line = dev.preset_step(1 if p == "up" else -1)
         elif p == "slot" and len(args) >= 2:
-            line = dev.set_slot(int(args[0]), int(args[1]))
+            line = ename(ctx, dev.set_slot(int(args[0]), int(args[1])))
         elif p == "toggle":
-            line = dev.toggle_ab()
+            line = ename(ctx, dev.toggle_ab())
+        elif p == "snapshot" and args:
+            act = str(args[0]).lower()
+            if act == "save" and len(args) > 1:
+                line = dev.snapshot_save(int(args[1]))
+            elif act == "recall" and len(args) > 1:
+                line = ename(ctx, dev.snapshot_recall(int(args[1])))
+            elif act == "swap":
+                line = dev.snapshot_swap()
+            elif act == "list":
+                snaps = dev.snapshot_list()
+                line = "snapshots:" + ("".join(snaps) if snaps else " none")
         elif p == "tap":
             b = ctx.tap.tap(time.monotonic())
             if b is not None:
@@ -572,9 +643,21 @@ def run_command(line: str, ctx) -> list[str]:
         if slot is None or len(t) < 3:
             out.append("usage: slot a|b|c <0-19>")
         else:
-            out.append(str(dev.set_slot(slot, int(t[2]))))
+            out.append(str(ename(ctx, dev.set_slot(slot, int(t[2])))))
     elif op == "toggle":
-        out.append(str(dev.toggle_ab()))
+        out.append(str(ename(ctx, dev.toggle_ab())))
+    elif op == "snapshot":
+        if len(t) < 2:
+            out.append("usage: snapshot save <0-9> | recall <0-9> | swap | list")
+        elif t[1] == "save" and len(t) > 2:
+            out.append(str(dev.snapshot_save(int(t[2]))))
+        elif t[1] == "recall" and len(t) > 2:
+            out.append(str(ename(ctx, dev.snapshot_recall(int(t[2])))))
+        elif t[1] == "swap":
+            out.append(str(dev.snapshot_swap()))
+        elif t[1] == "list":
+            snaps = dev.snapshot_list()
+            out += snaps if snaps else ["no snapshots"]
     elif op == "state":
         if dev.state is None:
             out.append("no pedal state")
@@ -723,6 +806,14 @@ def main() -> int:
         args.song_next_cc = int(cfg["song_next_cc"])
     if args.song_prev_cc == 85 and cfg.get("song_prev_cc"):
         args.song_prev_cc = int(cfg["song_prev_cc"])
+    if args.osc_port == 9000 and cfg.get("osc_port"):
+        args.osc_port = int(cfg["osc_port"])
+    if args.osc_host == "0.0.0.0" and cfg.get("osc_host"):
+        args.osc_host = cfg["osc_host"]
+    if args.tap_cc == CC_TAP and cfg.get("tap_cc") is not None:
+        args.tap_cc = int(cfg["tap_cc"])
+    if args.osc and cfg.get("osc") is False:
+        args.osc = False
 
     if args.scan:
         print("--- serial ---")

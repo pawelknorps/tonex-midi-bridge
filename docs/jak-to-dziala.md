@@ -103,8 +103,8 @@ Pełna tabela w README; kluczowe: `PC 0-19` / `CC 127 0-19` → preset, `CC 86/8
 
 ## 9. Weryfikacja
 
-- Wektory byte-exact: `test_proto.py` (10) + `test_features.py` (17) + `test_osc.py` (9) = **36/36** vs PyTonexControl + `node scripts/gen_vectors.js` + round-trip OSC.
-- Na żywo (Twój pedał, `/dev/cu.usbmodem211401`): sync stanu 164 B ✅, przełączenie 16↔17 z potwierdzeniem ✅, E2E przez IAC ✅, OSC `/preset 5` ✅, feedback CC127 odczytany na „ToneX Bridge Out" ✅, A/B toggle A→B→A ✅, tap tempo → BPM 119 ✅, pedał przywrócony bit-w-bit po testach ✅.
+- Wektory byte-exact: `test_proto.py` (10) + `test_features.py` (18) + `test_osc.py` (9) + `test_device.py` (6) = **43/43** vs PyTonexControl + `node scripts/gen_vectors.js` + round-trip OSC + fake-serial device layer.
+- Na żywo (Twój pedał, `/dev/cu.usbmodem211401`): sync stanu 164 B ✅, przełączenie 16↔17 z potwierdzeniem ✅, E2E przez IAC ✅, OSC `/preset 5` ✅, feedback CC127 odczytany na „ToneX Bridge Out" ✅, A/B toggle A→B→A ✅, snapshot save/recall = dokładne undo ✅, nazwy presetów w logach toggle ✅, tap tempo → BPM 119 ✅, pedał przywrócony bit-w-bit po testach ✅.
 - Mostek leci w jednym procesie, bez GUI; Ctrl+C = czyste zamknięcie portu.
 
 ## 10. Nazwy presetów
@@ -160,3 +160,9 @@ Odpowiedzi wracają na adres nadawcy (zapamiętany z `recvfrom`). Host domyślny
 
 - EOF na stdin (pipa, `</dev/null`, LaunchAgent) **nie kończy mostka**, gdy stdin nie jest TTY — to tryb serwerowy: sterowanie wyłącznie MIDI/OSC i przez pipę (`echo "state" | …tonex_bridge.py…`). Przy prawdziwym terminalu EOF = quit jak dotąd.
 - `scripts/install-launchagent.sh` — template `com.pawelknorps.tonex-bridge.plist` (podmiana ścieżek venv/bridge/logów) + `launchctl bootstrap`; `RunAtLoad` + `KeepAlive` → mostek wstaje przy logowaniu i restartuje się po crashu; logi `~/Library/Logs/tonex-bridge*.log`. Bez pedała mostek czeka w auto-reconnect.
+
+## 17. Snapshot A/B (undo całego stanu) + nazwy w logach
+
+- `snapshot save <0-9>` — kopiuje żywy stan (`dev.state`, 164 B: sloty A/B/C + cur + bypass + globalsy + BPM) do słownika; `snapshot recall <0-9>` — `_write_state` z zapisanym stanem (dokładny powrót, także do innego `cur`); `snapshot swap` wymienia 1↔2 (dwa brzmienia do porównania); `snapshot list` pokazuje zapisane. Trasa: CLI `snapshot …`, OSC `/snapshot save|recall|swap|list` (string + int). Uwaga: snapshot NIE cofa zmian parametrów per-preset zapisanych w pedale — to undo stanu (sloty/cur/globalsy/BPM).
+- **Nazwy presetów w logach**: `ename(ctx, line)` — regex `preset (\d+)` w liniach slot/toggle (MIDI router, OSC, CLI) dokleja nazwę z cache 20 nazw: `A/B toggle -> preset 8 (slot B) [RawMod '64 Custom Deluxe TOP1]`.
+- Warstwa urządzenia testowana na fake-serialu z poprawnym echem (`test_device.py`: state echo = `B9 03 81 06 03 82 <N> 80 0B 03 B9 02 81 06 03 0B` + N bajtów, N=payload[6]) — pacing `_write_state` rozwiązuje się na echo, nie na timeout.
